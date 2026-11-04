@@ -49,7 +49,7 @@ def write(tmp_path, name, data):
     return str(path)
 
 
-def grype_match(name="openssl", severity="High", version="3.5.0-1",
+def grype_match(name="openssl", severity="Critical", version="3.5.0-1",
                 vuln_id="CVE-2026-12345", fix_state="not-fixed", versions=()):
     return {
         "vulnerability": {
@@ -93,7 +93,7 @@ def test_summary_layout_and_suppressed_fix_versions(tmp_path):
     text = result.stdout
     header = "| Vulnerability | Severity | Packages | Fixed in | Status |"
     assert text.count(header) == 2
-    assert text.index("critical and high severity") < text.index(
+    assert text.index("critical severity") < text.index(
         "suppressed vulnerabilities")
     assert "| Suppressed | 1 |" in text
     assert "Total unique vulnerabilities: **1**" in text
@@ -107,9 +107,8 @@ def test_summary_layout_and_suppressed_fix_versions(tmp_path):
     assert "VEX fixed; VEX not_affected" in suppressed
 
 
-@pytest.mark.parametrize("severity", ["Critical", "High"])
-def test_summary_only_suppressed(tmp_path, severity):
-    match = grype_match(severity=severity)
+def test_summary_only_suppressed(tmp_path):
+    match = grype_match()
     data = {"matches": [], "ignoredMatches": [{
         "match": match,
         "appliedIgnoreRules": [{"vex-status": "not_affected"}],
@@ -119,17 +118,17 @@ def test_summary_only_suppressed(tmp_path, severity):
     assert result.returncode == 0, result.stderr
     assert "| Suppressed | 1 |" in result.stdout
     assert "| CVE-2026-12345 |" in result.stdout
-    assert "No critical or high severity vulnerabilities found" in \
+    assert "No critical severity vulnerabilities found" in \
         result.stdout
     assert result.stdout.index("No critical") < result.stdout.index(
-        "1 critical and high severity suppressed vulnerabilities")
+        "1 critical severity suppressed vulnerabilities")
     assert "\U0001F534</span> not-fixed" in result.stdout
 
 
-@pytest.mark.parametrize("severity", ["Medium", "Low", "Negligible",
+@pytest.mark.parametrize("severity", ["High", "Medium", "Low", "Negligible",
                                       "Unknown"])
 def test_summary_counts_only_lower_suppressed(tmp_path, severity):
-    # suppressed like open vulnerabilities, only counted below high
+    # suppressed like open vulnerabilities, only counted below critical
     data = {"matches": [], "ignoredMatches": [
         {"match": grype_match(severity=severity),
          "appliedIgnoreRules": [{"vex-status": "not_affected"}]},
@@ -142,7 +141,7 @@ def test_summary_counts_only_lower_suppressed(tmp_path, severity):
     assert "| Suppressed | 2 |" in result.stdout
     assert "| CVE-2026-2 |" in result.stdout
     assert "| CVE-2026-12345 |" not in result.stdout
-    assert "1 critical and high severity suppressed vulnerabilities" in \
+    assert "1 critical severity suppressed vulnerabilities" in \
         result.stdout
 
 
@@ -155,7 +154,7 @@ def test_summary_no_critical_or_high_suppressed(tmp_path):
                     write(tmp_path, "grype.json", data))
     assert result.returncode == 0, result.stderr
     assert "| Suppressed | 1 |" in result.stdout
-    assert "No critical or high severity vulnerabilities suppressed." in \
+    assert "No critical severity vulnerabilities suppressed." in \
         result.stdout
     assert "| CVE-2026-12345 |" not in result.stdout
 
@@ -276,3 +275,19 @@ def test_summary_skips_kernel_headers_duplicates(tmp_path):
     assert "untriaged" in rows[0]
     assert "VEX fixed" in rows[1]
     assert "linux-headers" not in result.stdout
+
+
+def test_summary_counts_only_high_open(tmp_path):
+    # open high severity vulnerabilities are counted, not listed
+    data = {"matches": [grype_match(severity="High"),
+                        grype_match(severity="Critical",
+                                    vuln_id="CVE-2026-2")],
+            "ignoredMatches": []}
+    result = script("grype-vulnerability-summary.py",
+                    write(tmp_path, "grype.json", data))
+    assert result.returncode == 0, result.stderr
+    assert "| High | 1 |" in result.stdout
+    assert "| Critical | 1 |" in result.stdout
+    assert "1 critical severity vulnerabilities" in result.stdout
+    assert "| CVE-2026-2 |" in result.stdout
+    assert "| CVE-2026-12345 |" not in result.stdout
