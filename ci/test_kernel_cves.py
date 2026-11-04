@@ -296,6 +296,7 @@ def kernel_repository(tmp_path):
     repo.mkdir()
     git(repo, "init", "--quiet", "--initial-branch=main")
     commit(repo, "Linux 7.2")
+    git(repo, "tag", "v7.2")
     git(repo, "checkout", "--quiet", "-b", "upstream")
     merged = commit(repo, "net: fix merged")
     picked = commit(repo, "mm: fix cherry-picked")
@@ -330,7 +331,8 @@ def test_fix_commits(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "4 kernel CVEs, 4 affect the version" in result.stdout
     assert f"3 of them fixed by commits of the build, {head[:12]} " \
-        "(2 backported): fixed" in result.stdout
+        "(2 backported; history since 2025-12-31, 274 days before v7.2): " \
+        "fixed" in result.stdout
     assert "1 open: 1 unknown" in result.stdout
     statements = {s["vulnerability"]["name"]: s
                   for s in json.loads(vex.read_text())["statements"]}
@@ -375,3 +377,59 @@ def test_backport_trailers(message):
     if "{sha}" in message:
         # only the backported commit, not one starting like it
         assert history.fix(["ab" * 6 + "cd" * 14]) is None
+
+
+def old_base_repository(tmp_path, tag=True):
+    # a branch of a release of 2024, built in 2026, with a fix merged in 2024
+    repo = tmp_path / "kernel"
+    repo.mkdir()
+    git(repo, "init", "--quiet", "--initial-branch=main")
+    commit(repo, "Linux 6.6", date="2024-01-01T00:00:00Z")
+    if tag:
+        git(repo, "tag", "v6.6")
+    git(repo, "checkout", "--quiet", "-b", "upstream")
+    fix = commit(repo, "net: fix", date="2023-12-01T00:00:00Z")
+    git(repo, "checkout", "--quiet", "main")
+    git(repo, "merge", "--quiet", "--no-ff", "-m", "Merge fix", fix,
+        date="2024-02-01T00:00:00Z")
+    head = commit(repo, "arm64: dts: qcom: new board")
+    version = f"6.6.0+git20261008~g{head[:12]}-0qli1~bpo13+1"
+    sbom, _ = write_inputs(tmp_path, [
+        record("CVE-2026-30", semver("5.4", mainline="6.7"), ["net/a.c"],
+               fixes=[fix])], version=version)
+    return repo, sbom
+
+
+def test_fix_commits_history_from_base_tag(tmp_path):
+    # the history starts before the release the kernel is based on, however
+    # old, not before its build
+    repo, sbom = old_base_repository(tmp_path)
+    result = run_script("--vulns", tmp_path / "vulns", "--sbom", sbom,
+                        "--kernel-repository", f"file://{repo}")
+    assert result.returncode == 0, result.stderr
+    assert "1 of them fixed by commits of the build" in result.stdout
+    assert "history since 2023-04-02, 274 days before v6.6" in result.stdout
+    assert "0 open" in result.stdout
+
+
+def test_fix_commits_history_without_base_tag(tmp_path):
+    # without the tag, the year before the build date, missing the old fix
+    repo, sbom = old_base_repository(tmp_path, tag=False)
+    result = run_script("--vulns", tmp_path / "vulns", "--sbom", sbom,
+                        "--kernel-repository", f"file://{repo}")
+    assert result.returncode == 0, result.stderr
+    assert "0 of them fixed by commits of the build" in result.stdout
+    assert "history since 2025-10-08, 365 days before the build date, " \
+        "without v6.6" in result.stdout
+    assert "1 open" in result.stdout
+
+
+@pytest.mark.parametrize("version, tag", [
+    ("7.3.0", "v7.3"), ("7.3.5", "v7.3"), ("7.3.0-rc4", "v7.3-rc4"),
+    ("2.6.32.1", "v2.6.32"),
+])
+def test_base_tag(version, tag):
+    numbers, _, rc = version.partition("-rc")
+    kernel = kernel_cves.KernelVersion(map(int, numbers.split(".")),
+                                       int(rc) if rc else None)
+    assert kernel_cves.base_tag(kernel) == tag

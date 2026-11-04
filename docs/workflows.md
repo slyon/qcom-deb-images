@@ -123,9 +123,13 @@ cached), and `scripts/kernel-cves.py` assesses the kernel of each image:
   candidates and git snapshots carry fixes their version doesn't tell, e.g.
   a 7.3-rc4 snapshot those merged for 7.3 by then. Backports count when
   they name the commit they backport, the way `git cherry-pick -x` and the
-  stable releases do. The scan fetches the commits of the year before the
-  build date from [qualcomm-linux/kernel](https://github.com/qualcomm-linux/kernel),
-  without their files, about 50 MB
+  stable releases do. The scan fetches the commits of the 9 months before the
+  upstream tag the kernel is based on (e.g. `v7.3` or `v7.3-rc4`) from
+  [qualcomm-linux/kernel](https://github.com/qualcomm-linux/kernel), without
+  their files, about 40 MB: the commits merged in a release cycle are
+  committed at most about 6 months before it. Without that tag, it's the
+  year before the build date. A fix older than that is missed, so its CVE
+  stays open
 
 The counts are in `rootfs-kernel-cves.txt` and in the job summary. Backports
 naming no upstream commit, e.g. of patches from a mailing list

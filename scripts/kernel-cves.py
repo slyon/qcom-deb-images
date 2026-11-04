@@ -42,9 +42,13 @@
 # 7.3.0+git20261030~gae2606baf50f-0qli1~bpo13+1: a CVE one of whose fix
 # commits, mainline or stable, is merged into the build, or which a commit of
 # the build names as backported, the way git cherry-pick -x and the stable
-# releases do, gets a fixed statement. Only the commits of the year before the
-# build date are fetched, without their files: the fixes and backports in
-# question are younger than the base release of the kernel. Backports naming
+# releases do, gets a fixed statement. Only the commits of the 9 months before
+# the upstream tag the kernel is based on, e.g. v7.3 or v7.3-rc4, are fetched,
+# without their files: the fixes and backports in question are merged after
+# the release before, and the commits merged in a release cycle are committed
+# at most about 6 months before it (188 days for 7.3-rc4), 99.9% of them 2.5
+# months. Without that tag, it's the year before the build date. A fix older
+# than that is missed, and its CVE stays open. Backports naming
 # no upstream commit, e.g. of patches from a mailing list, aren't recognized.
 
 import argparse
@@ -83,7 +87,10 @@ RELEASE = float("inf")
 # the build date and commit of a QLI kernel package version
 DEB_GIT_RE = re.compile(
     r"\+git(?P<date>\d{8})~g(?P<commit>[0-9a-f]{7,40})(?:-|$)")
-HISTORY_DAYS = 365
+# how far back the history is fetched, before the upstream tag of the
+# kernel, or before its build date when that tag isn't known
+BASE_TAG_DAYS = 274
+BUILD_DATE_DAYS = 365
 GITHUB_RE = re.compile(
     r"https://github\.com/(?P<repository>[^/]+/[^/]+?)(?:\.git)?/?")
 # how backports name the commit they backport: git cherry-pick -x, the stable
@@ -309,32 +316,53 @@ def git(*args, **kwargs):
                           text=True, **kwargs).stdout
 
 
-def resolve_commit(repository, commit):
-    # the full commit ID of an abbreviated one, which git can't fetch: from
-    # GitHub's API, or from a local repository
+def commit_info(repository, ref):
+    # the full commit ID and the commit date of a commit, by abbreviated ID
+    # (which git can't fetch) or tag: from GitHub's API, or from a local
+    # repository
     match = GITHUB_RE.fullmatch(repository)
     if match:
         request = urllib.request.Request(
             f"https://api.github.com/repos/{match['repository']}/commits/"
-            f"{commit}", headers={"Accept": "application/vnd.github+json"})
+            f"{ref}", headers={"Accept": "application/vnd.github+json"})
         token = os.environ.get("GITHUB_TOKEN")
         if token:
             request.add_header("Authorization", f"Bearer {token}")
         with urllib.request.urlopen(request, timeout=60) as response:
-            sha = json.load(response).get("sha", "")
+            data = json.load(response)
+        sha = data.get("sha", "")
+        date = ((data.get("commit") or {}).get("committer") or {}).get(
+            "date", "")
     else:
         path = repository.removeprefix("file://")
-        sha = git("-C", path, "rev-parse", "--verify",
-                  f"{commit}^{{commit}}").strip()
-    if not SHA_RE.fullmatch(sha) or not sha.startswith(commit):
+        sha, _, date = git("-C", path, "log", "-1", "--format=%H%x00%cI",
+                           f"{ref}^{{commit}}", "--").strip().partition("\0")
+    if not SHA_RE.fullmatch(sha):
+        raise ValueError(f"cannot resolve {ref} of {repository}")
+    return sha, datetime.fromisoformat(date.replace("Z", "+00:00"))
+
+
+def resolve_commit(repository, commit):
+    sha, _ = commit_info(repository, commit)
+    if not sha.startswith(commit):
         raise ValueError(f"cannot resolve commit {commit} of {repository}")
     return sha
 
 
+def base_tag(version):
+    # the upstream tag of a kernel version, without the stable release:
+    # v7.3 of 7.3.0 and 7.3.5, v7.3-rc4 of 7.3.0-rc4, v2.6.32 of 2.6.32.1
+    numbers = version.numbers[:3 if version.numbers[0] < 3 else 2]
+    tag = "v" + ".".join(map(str, numbers))
+    return f"{tag}-rc{version.rc}" if version.rc is not None else tag
+
+
 class KernelHistory:
     # the commits of the history of a kernel build, and those they backport
-    def __init__(self, head, log):
+    def __init__(self, head, log, since=None):
         self.head = head
+        # where the fetched history starts, and why
+        self.since = since
         self.commits = set()
         # first 12 digits of a backported commit: (its ID as given, the
         # backport)
@@ -363,19 +391,33 @@ class KernelHistory:
         return None
 
 
+def history_start(repository, version, build_date):
+    # (date, why) the history is fetched from: before the upstream tag of the
+    # kernel, or else before its build date
+    tag = base_tag(version)
+    try:
+        _, date = commit_info(repository, tag)
+        days, anchor = BASE_TAG_DAYS, tag
+    except (OSError, ValueError, subprocess.CalledProcessError):
+        date = datetime.strptime(build_date, "%Y%m%d")
+        days, anchor = BUILD_DATE_DAYS, "the build date, without " + tag
+    since = date - timedelta(days=days)
+    return since, f"{since:%Y-%m-%d}, {days} days before {anchor}"
+
+
 def load_history(repository, deb_version, tmp):
     match = DEB_GIT_RE.search(deb_version)
     if not match:
         raise ValueError("no build commit in the package version")
     head = resolve_commit(repository, match["commit"])
-    since = datetime.strptime(match["date"], "%Y%m%d") - \
-        timedelta(days=HISTORY_DAYS)
+    since, why = history_start(repository, deb_kernel_version(deb_version),
+                               match["date"])
     directory = tempfile.mkdtemp(dir=tmp)
     git("init", "--quiet", "--bare", directory)
     git("-C", directory, "fetch", "--quiet", "--filter=tree:0",
         f"--shallow-since={since:%Y-%m-%d}", repository, head)
     return KernelHistory(head, git("-C", directory, "log",
-                                   "--format=%H%x00%B%x00", head))
+                                   "--format=%H%x00%B%x00", head), why)
 
 
 def fixed_statement(cve_id, binaries, deb_version, source, history, fix,
@@ -462,7 +504,8 @@ def assess(args, records, release, tmp, source, deb_version, binaries):
           "version")
     if history:
         print(f"  {fixed} of them fixed by commits of the build, "
-              f"{history.head[:12]} ({backported} backported): fixed")
+              f"{history.head[:12]} ({backported} backported; history since "
+              f"{history.since}): fixed")
     if sources is not None:
         print(f"  {not_present} of them change no compiled file: "
               "not_affected")
