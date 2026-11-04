@@ -236,10 +236,9 @@ def osv_record(record, source, release, deb_version):
         "details": description,
         "affected": [{
             "package": {"ecosystem": f"Debian:{release}", "name": source},
-            # exactly the version assessed
-            "ranges": [{"type": "ECOSYSTEM", "events": [
-                {"introduced": deb_version},
-                {"last_affected": deb_version}]}],
+            # exactly the version assessed, which no package version is known
+            # to fix yet
+            "versions": [deb_version],
         }],
         "references": [{"type": "ADVISORY",
                         "url": f"https://www.cve.org/CVERecord?id={cve_id}"}]

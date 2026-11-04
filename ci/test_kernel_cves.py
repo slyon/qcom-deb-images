@@ -180,8 +180,7 @@ def test_run(tmp_path):
     assert osv["database_specific"] == {"severity": "high"}
     assert osv["affected"] == [{
         "package": {"ecosystem": "Debian:13", "name": "linux-qcom-7.2"},
-        "ranges": [{"type": "ECOSYSTEM", "events": [
-            {"introduced": QLI_VERSION}, {"last_affected": QLI_VERSION}]}],
+        "versions": [QLI_VERSION],
     }]
 
     vex = json.loads((tmp_path / "kernel.openvex.json").read_text())
