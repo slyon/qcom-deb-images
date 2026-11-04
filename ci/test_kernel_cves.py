@@ -38,7 +38,8 @@ def semver(introduced, *fixes, mainline=None):
     return versions
 
 
-def record(cve_id, versions, files, default="affected", severity=None):
+def record(cve_id, versions, files, default="affected", severity=None,
+           fixes=()):
     cna = {
         "descriptions": [{"lang": "en", "value":
                           "In the Linux kernel, the following vulnerability "
@@ -50,6 +51,15 @@ def record(cve_id, versions, files, default="affected", severity=None):
         }],
         "references": [{"url": f"https://git.kernel.org/stable/c/{cve_id}"}],
     }
+    if fixes:
+        # the git ranges, one per mainline or stable fix commit
+        cna["affected"].insert(0, {
+            "product": "Linux", "vendor": "Linux",
+            "defaultStatus": "unaffected", "programFiles": files,
+            "versions": [{"version": "1" * 40, "lessThan": fix,
+                          "status": "affected", "versionType": "git"}
+                         for fix in fixes],
+        })
     if severity:
         cna["metrics"] = [{"cvssV3_1": {
             "baseSeverity": severity,
@@ -121,14 +131,14 @@ def test_compiled(files, present):
     assert kernel_cves.compiled(files, sources) == present
 
 
-def write_inputs(tmp_path, records):
+def write_inputs(tmp_path, records, version=QLI_VERSION):
     for cve in records:
         cve_id = cve["cveMetadata"]["cveId"]
         path = tmp_path / "vulns" / "cve" / "published" / \
             cve_id.split("-")[1] / f"{cve_id}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(cve))
-    debs = [{"type": "deb", "name": name, "version": QLI_VERSION,
+    debs = [{"type": "deb", "name": name, "version": version,
              "metadata": {"source": "linux-qcom-7.2"}}
             for name in ("linux-image-qcom-7.2", "linux-headers-qcom-7.2")]
     debs.append({"type": "deb", "name": "bash", "version": "5.2.37-2",
@@ -262,3 +272,106 @@ def test_needs_vulns(tmp_path):
     result = run_script("--sbom", sbom)
     assert result.returncode == 2
     assert "--vulns is required" in result.stderr
+
+
+def git(repo, *args, date="2026-10-01T12:00:00Z"):
+    env = dict(os.environ, GIT_AUTHOR_DATE=date, GIT_COMMITTER_DATE=date,
+               GIT_AUTHOR_NAME="A", GIT_AUTHOR_EMAIL="a@example.com",
+               GIT_COMMITTER_NAME="A", GIT_COMMITTER_EMAIL="a@example.com",
+               GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1")
+    return subprocess.run(["git", "-C", str(repo), *args], check=True,
+                          capture_output=True, text=True,
+                          env=env).stdout.strip()
+
+
+def commit(repo, message, **kwargs):
+    git(repo, "commit", "--quiet", "--allow-empty", "-m", message, **kwargs)
+    return git(repo, "rev-parse", "HEAD")
+
+
+def kernel_repository(tmp_path):
+    # a kernel branch merging one upstream fix and backporting two others,
+    # with git cherry-pick -x and the way the stable releases do
+    repo = tmp_path / "kernel"
+    repo.mkdir()
+    git(repo, "init", "--quiet", "--initial-branch=main")
+    commit(repo, "Linux 7.2")
+    git(repo, "checkout", "--quiet", "-b", "upstream")
+    merged = commit(repo, "net: fix merged")
+    picked = commit(repo, "mm: fix cherry-picked")
+    stable = commit(repo, "fs: fix backported to stable")
+    git(repo, "checkout", "--quiet", "main")
+    git(repo, "merge", "--quiet", "--no-ff", "-m", "Merge fixes", merged)
+    commit(repo, f"mm: fix cherry-picked\n\n(cherry picked from commit "
+                 f"{picked})")
+    head = commit(repo, f"fs: fix backported\n\ncommit {stable} upstream.")
+    return repo, head, {"merged": merged, "picked": picked,
+                        "stable": stable}
+
+
+def test_fix_commits(tmp_path):
+    repo, head, fixes = kernel_repository(tmp_path)
+    version = f"7.2.0+git20261008~g{head[:12]}-0qli1~bpo13+1"
+    sbom, _ = write_inputs(tmp_path, [
+        record("CVE-2026-20", semver("5.4", mainline="7.3"), ["net/a.c"],
+               fixes=["2" * 40, fixes["merged"]]),
+        record("CVE-2026-21", semver("5.4", mainline="7.3"), ["mm/b.c"],
+               fixes=[fixes["picked"]]),
+        record("CVE-2026-22", semver("5.4", mainline="7.3"), ["fs/c.c"],
+               fixes=[fixes["stable"]]),
+        # not in the history
+        record("CVE-2026-23", semver("5.4", mainline="7.3"), ["fs/d.c"],
+               fixes=["3" * 40]),
+    ], version=version)
+    vex = tmp_path / "kernel.openvex.json"
+    result = run_script("--vulns", tmp_path / "vulns", "--sbom", sbom,
+                        "--kernel-repository", f"file://{repo}",
+                        "--vex", vex)
+    assert result.returncode == 0, result.stderr
+    assert "4 kernel CVEs, 4 affect the version" in result.stdout
+    assert f"3 of them fixed by commits of the build, {head[:12]} " \
+        "(2 backported): fixed" in result.stdout
+    assert "1 open: 1 unknown" in result.stdout
+    statements = {s["vulnerability"]["name"]: s
+                  for s in json.loads(vex.read_text())["statements"]}
+    assert sorted(statements) == ["CVE-2026-20", "CVE-2026-21",
+                                  "CVE-2026-22"]
+    assert all(s["status"] == "fixed" for s in statements.values())
+    assert statements["CVE-2026-20"]["status_notes"].startswith(
+        f"The fix {fixes['merged']} is in linux-qcom-7.2 {version}, built "
+        f"from {head} (")
+    assert "which backports it" in \
+        statements["CVE-2026-21"]["status_notes"]
+    assert statements["CVE-2026-21"]["products"][0]["subcomponents"][0] == \
+        {"@id": f"pkg:deb/debian/linux-headers-qcom-7.2@{version}"}
+
+
+def test_fix_commits_without_build_commit(tmp_path):
+    # e.g. Debian's kernel versions name no commit
+    repo, _, fixes = kernel_repository(tmp_path)
+    sbom, _ = write_inputs(tmp_path, [
+        record("CVE-2026-20", semver("5.4", mainline="7.3"), ["net/a.c"],
+               fixes=[fixes["merged"]])], version="7.2.0-1")
+    result = run_script("--vulns", tmp_path / "vulns", "--sbom", sbom,
+                        "--kernel-repository", f"file://{repo}")
+    assert result.returncode == 0, result.stderr
+    assert "warning: no history of linux-qcom-7.2 7.2.0-1" in result.stdout
+    assert "no build commit in the package version" in result.stdout
+    assert "1 open" in result.stdout
+
+
+@pytest.mark.parametrize("message", [
+    "x\n\n(cherry picked from commit {sha})",
+    "x\n\n(cherry picked from commit {short})",
+    "x\n\ncommit {sha} upstream.\n\nbody",
+    "x\n\n[ Upstream commit {sha} ]",
+    "x\n\n(backported from commit {sha})",
+])
+def test_backport_trailers(message):
+    sha = "ab" * 20
+    log = "9" * 40 + "\0" + message.format(sha=sha, short=sha[:12]) + "\0\n"
+    history = kernel_cves.KernelHistory("9" * 40, log)
+    assert history.fix(["cd" * 20, sha]) == (sha, "9" * 40)
+    if "{sha}" in message:
+        # only the backported commit, not one starting like it
+        assert history.fix(["ab" * 6 + "cd" * 14]) is None

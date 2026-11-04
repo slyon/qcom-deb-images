@@ -117,11 +117,19 @@ cached), and `scripts/kernel-cves.py` assesses the kernel of each image:
   repository's signature. Without that package, e.g. for kernels built with
   `bindeb-pkg` or ones removed from the repository by now, the kernel is
   assessed by version alone, with a warning
+* those one of whose fix commits, mainline or stable, is in the history of
+  the commit the kernel is built from, which its package version names (e.g.
+  `ae2606baf50f`), get a `fixed` statement in that document: release
+  candidates and git snapshots carry fixes their version doesn't tell, e.g.
+  a 7.3-rc4 snapshot those merged for 7.3 by then. Backports count when
+  they name the commit they backport, the way `git cherry-pick -x` and the
+  stable releases do. The scan fetches the commits of the year before the
+  build date from [qualcomm-linux/kernel](https://github.com/qualcomm-linux/kernel),
+  without their files, about 50 MB
 
-The counts are in `rootfs-kernel-cves.txt` and in the job summary. The
-version check is conservative: release candidates and git snapshots count as
-their base version, and fixes backported outside of stable releases aren't
-known.
+The counts are in `rootfs-kernel-cves.txt` and in the job summary. Backports
+naming no upstream commit, e.g. of patches from a mailing list
+(`FROMLIST:`), aren't recognized.
 
 ### Latest compliance data
 

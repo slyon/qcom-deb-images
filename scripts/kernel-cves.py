@@ -32,16 +32,32 @@
 # The version check is conservative: release candidates and git snapshots
 # count as their base version, so a fix merged in 7.3-rc2 still counts as
 # missing in 7.3.0-rc4 snapshots, and backports outside of stable releases
-# are not known. Files other than C, assembly or Rust sources and headers
-# count as compiled, e.g. device trees; documentation never does.
+# are not known, unless --kernel-repository is given, see below. Files other
+# than C, assembly or Rust sources and headers count as compiled, e.g. device
+# trees; documentation never does.
+#
+# With --kernel-repository, the git repository the kernel is built from, the
+# fixes are looked up in the history of its build commit too, which QLI
+# kernel package versions name, e.g. ae2606baf50f of
+# 7.3.0+git20261030~gae2606baf50f-0qli1~bpo13+1: a CVE one of whose fix
+# commits, mainline or stable, is merged into the build, or which a commit of
+# the build names as backported, the way git cherry-pick -x and the stable
+# releases do, gets a fixed statement. Only the commits of the year before the
+# build date are fetched, without their files: the fixes and backports in
+# question are younger than the base release of the kernel. Backports naming
+# no upstream commit, e.g. of patches from a mailing list, aren't recognized.
 
 import argparse
 import glob
 import json
 import os
 import re
+import subprocess
 import sys
-from datetime import datetime, timezone
+import tempfile
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta, timezone
 
 PRODUCT = "pkg:generic/qualcomm-linux-debian-rootfs"
 AUTHOR = "Qualcomm Linux Debian images maintainers"
@@ -63,6 +79,22 @@ DEB_KERNEL_VERSION_RE = re.compile(
 # bounds of a stable branch or of all versions
 CVE_VERSION_RE = re.compile(r"\d+(?:\.\d+)*")
 RELEASE = float("inf")
+
+# the build date and commit of a QLI kernel package version
+DEB_GIT_RE = re.compile(
+    r"\+git(?P<date>\d{8})~g(?P<commit>[0-9a-f]{7,40})(?:-|$)")
+HISTORY_DAYS = 365
+GITHUB_RE = re.compile(
+    r"https://github\.com/(?P<repository>[^/]+/[^/]+?)(?:\.git)?/?")
+# how backports name the commit they backport: git cherry-pick -x, the stable
+# releases (both forms) and Ubuntu's
+BACKPORT_RES = [
+    re.compile(r"\(cherry picked from commit ([0-9a-f]{12,40})\)"),
+    re.compile(r"^commit ([0-9a-f]{40}) upstream\.?$", re.MULTILINE),
+    re.compile(r"\[ ?[Uu]pstream commit ([0-9a-f]{12,40}) ?\]"),
+    re.compile(r"\(backported from commit ([0-9a-f]{12,40})"),
+]
+SHA_RE = re.compile(r"[0-9a-f]{40}")
 
 
 class KernelVersion:
@@ -259,6 +291,111 @@ def vex_statement(cve_id, binaries, deb_version, files, source):
     }
 
 
+def fix_commits(record):
+    # the mainline and stable commits fixing a CVE, from the git ranges of
+    # its record
+    return sorted({entry["lessThan"]
+                   for affected in record["containers"]["cna"].get(
+                       "affected", [])
+                   if affected.get("product") == "Linux"
+                   for entry in affected.get("versions", [])
+                   if entry.get("versionType") == "git"
+                   and entry.get("status") == "affected"
+                   and SHA_RE.fullmatch(entry.get("lessThan", ""))})
+
+
+def git(*args, **kwargs):
+    return subprocess.run(["git", *args], check=True, capture_output=True,
+                          text=True, **kwargs).stdout
+
+
+def resolve_commit(repository, commit):
+    # the full commit ID of an abbreviated one, which git can't fetch: from
+    # GitHub's API, or from a local repository
+    match = GITHUB_RE.fullmatch(repository)
+    if match:
+        request = urllib.request.Request(
+            f"https://api.github.com/repos/{match['repository']}/commits/"
+            f"{commit}", headers={"Accept": "application/vnd.github+json"})
+        token = os.environ.get("GITHUB_TOKEN")
+        if token:
+            request.add_header("Authorization", f"Bearer {token}")
+        with urllib.request.urlopen(request, timeout=60) as response:
+            sha = json.load(response).get("sha", "")
+    else:
+        path = repository.removeprefix("file://")
+        sha = git("-C", path, "rev-parse", "--verify",
+                  f"{commit}^{{commit}}").strip()
+    if not SHA_RE.fullmatch(sha) or not sha.startswith(commit):
+        raise ValueError(f"cannot resolve commit {commit} of {repository}")
+    return sha
+
+
+class KernelHistory:
+    # the commits of the history of a kernel build, and those they backport
+    def __init__(self, head, log):
+        self.head = head
+        self.commits = set()
+        # first 12 digits of a backported commit: (its ID as given, the
+        # backport)
+        self.backports = {}
+        for entry in log.split("\0\n"):
+            sha, _, message = entry.partition("\0")
+            sha = sha.strip()
+            if not SHA_RE.fullmatch(sha):
+                continue
+            self.commits.add(sha)
+            for pattern in BACKPORT_RES:
+                for backported in pattern.findall(message):
+                    self.backports.setdefault(backported[:12],
+                                              (backported, sha))
+
+    def fix(self, fixes):
+        # (fix, the commit of the build bringing it in) of the first fix in
+        # the history, merged or backported; None without
+        for fix in fixes:
+            if fix in self.commits:
+                return fix, fix
+        for fix in fixes:
+            backported, commit = self.backports.get(fix[:12], ("", None))
+            if commit and fix.startswith(backported):
+                return fix, commit
+        return None
+
+
+def load_history(repository, deb_version, tmp):
+    match = DEB_GIT_RE.search(deb_version)
+    if not match:
+        raise ValueError("no build commit in the package version")
+    head = resolve_commit(repository, match["commit"])
+    since = datetime.strptime(match["date"], "%Y%m%d") - \
+        timedelta(days=HISTORY_DAYS)
+    directory = tempfile.mkdtemp(dir=tmp)
+    git("init", "--quiet", "--bare", directory)
+    git("-C", directory, "fetch", "--quiet", "--filter=tree:0",
+        f"--shallow-since={since:%Y-%m-%d}", repository, head)
+    return KernelHistory(head, git("-C", directory, "log",
+                                   "--format=%H%x00%B%x00", head))
+
+
+def fixed_statement(cve_id, binaries, deb_version, source, history, fix,
+                    commit):
+    notes = f"The fix {fix} is in {source} {deb_version}, built from " \
+        f"{history.head}"
+    if commit != fix:
+        notes += f", as {commit}, which backports it"
+    return {
+        "vulnerability": {"name": cve_id},
+        "products": [{
+            "@id": PRODUCT,
+            "subcomponents": [{"@id": f"pkg:deb/debian/{name}@{deb_version}"}
+                              for name in binaries],
+        }],
+        "status": "fixed",
+        "status_notes": notes + " (generated by scripts/kernel-cves.py).",
+    }
+
+
 def load_compiled_sources(path, source, deb_version):
     # the compiled sources of a kernel, from a list or from a directory of
     # lists named after the kernels; None when there is none
@@ -269,6 +406,70 @@ def load_compiled_sources(path, source, deb_version):
             return None
     with open(path, encoding="utf-8") as f:
         return {line.strip() for line in f if line.strip()}
+
+
+def assess(args, records, release, tmp, source, deb_version, binaries):
+    # the VEX statements about the CVEs of a kernel
+    version = deb_kernel_version(deb_version)
+    sources = None
+    if args.compiled_sources:
+        sources = load_compiled_sources(args.compiled_sources, source,
+                                        deb_version)
+        if sources is None:
+            print(f"warning: no compiled sources for {source} "
+                  f"{deb_version}, not checking them")
+    history = None
+    if args.kernel_repository:
+        try:
+            history = load_history(args.kernel_repository, deb_version, tmp)
+        except (OSError, ValueError, urllib.error.URLError,
+                subprocess.CalledProcessError) as error:
+            detail = (getattr(error, "stderr", None) or "").strip()
+            print(f"warning: no history of {source} {deb_version} from "
+                  f"{args.kernel_repository}, not checking the fix commits: "
+                  f"{error} {detail}".rstrip())
+    affected = [r for r in records if cve_affects(r, version)]
+    statements = []
+    fixed, backported, not_present = 0, 0, 0
+    open_severities = {}
+    for record in affected:
+        cve_id = record["cveMetadata"]["cveId"]
+        files = program_files(record)
+        if args.osv_dir:
+            path = os.path.join(args.osv_dir, f"{source}_{deb_version}",
+                                f"{cve_id}.osv.json")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(osv_record(record, source, release, deb_version),
+                          f, indent=2)
+                f.write("\n")
+        fix = history.fix(fix_commits(record)) if history else None
+        if fix:
+            fixed += 1
+            backported += fix[0] != fix[1]
+            statements.append(fixed_statement(cve_id, binaries, deb_version,
+                                              source, history, *fix))
+        elif sources is not None and files and not compiled(files, sources):
+            not_present += 1
+            statements.append(vex_statement(cve_id, binaries, deb_version,
+                                            files, source))
+        else:
+            level = severity(record)[0]
+            open_severities[level] = open_severities.get(level, 0) + 1
+    print(f"{source} {deb_version} (kernel {version}, "
+          f"{', '.join(binaries)}):")
+    print(f"  {len(records)} kernel CVEs, {len(affected)} affect the "
+          "version")
+    if history:
+        print(f"  {fixed} of them fixed by commits of the build, "
+              f"{history.head[:12]} ({backported} backported): fixed")
+    if sources is not None:
+        print(f"  {not_present} of them change no compiled file: "
+              "not_affected")
+    print(f"  {len(affected) - fixed - not_present} open: " + ", ".join(
+        f"{count} {level}" for level, count in sorted(
+            open_severities.items(), key=lambda item: -item[1])))
+    return statements
 
 
 def run(args):
@@ -291,47 +492,10 @@ def run(args):
     records = list(load_cves(args.vulns))
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     statements = []
-    for source, (deb_version, binaries) in sorted(kernels.items()):
-        version = deb_kernel_version(deb_version)
-        sources = None
-        if args.compiled_sources:
-            sources = load_compiled_sources(args.compiled_sources, source,
-                                            deb_version)
-            if sources is None:
-                print(f"warning: no compiled sources for {source} "
-                      f"{deb_version}, not checking them")
-        affected = [r for r in records if cve_affects(r, version)]
-        not_present = []
-        open_severities = {}
-        for record in affected:
-            cve_id = record["cveMetadata"]["cveId"]
-            files = program_files(record)
-            if args.osv_dir:
-                path = os.path.join(args.osv_dir, f"{source}_{deb_version}",
-                                    f"{cve_id}.osv.json")
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                with open(path, "w", encoding="utf-8") as f:
-                    json.dump(osv_record(record, source, release,
-                                         deb_version), f, indent=2)
-                    f.write("\n")
-            if sources is not None and files and \
-                    not compiled(files, sources):
-                not_present.append(cve_id)
-                statements.append(vex_statement(cve_id, binaries,
-                                                deb_version, files, source))
-            else:
-                level = severity(record)[0]
-                open_severities[level] = open_severities.get(level, 0) + 1
-        print(f"{source} {deb_version} (kernel {version}, "
-              f"{', '.join(binaries)}):")
-        print(f"  {len(records)} kernel CVEs, {len(affected)} affect the "
-              "version")
-        if sources is not None:
-            print(f"  {len(not_present)} of them change no compiled file: "
-                  "not_affected")
-        print(f"  {len(affected) - len(not_present)} open: " + ", ".join(
-            f"{count} {level}" for level, count in sorted(
-                open_severities.items(), key=lambda item: -item[1])))
+    with tempfile.TemporaryDirectory() as tmp:
+        for source, (deb_version, binaries) in sorted(kernels.items()):
+            statements.extend(assess(args, records, release, tmp, source,
+                                     deb_version, binaries))
 
     # an OpenVEX document needs statements
     if args.vex and statements:
@@ -377,15 +541,23 @@ def main():
                              "affecting the kernel to, in a <source>_"
                              "<version> subdirectory per kernel, for "
                              "scripts/grype-db-add-advisories.py")
+    parser.add_argument("--kernel-repository",
+                        help="git repository the kernels are built from, "
+                             "e.g. https://github.com/qualcomm-linux/kernel, "
+                             "to look the fix commits up in the history of "
+                             "their build commits; GitHub's API resolves "
+                             "the abbreviated commit IDs of the package "
+                             "versions, with GITHUB_TOKEN if set")
     parser.add_argument("--vex",
-                        help="OpenVEX document to write the not_affected "
-                             "statements to, unless there are none; needs "
-                             "--compiled-sources")
+                        help="OpenVEX document to write the fixed and "
+                             "not_affected statements to, unless there are "
+                             "none; needs --compiled-sources or "
+                             "--kernel-repository")
     args = parser.parse_args()
     if not args.list_kernels and not args.vulns:
         parser.error("--vulns is required")
-    if args.vex and not args.compiled_sources:
-        parser.error("--vex needs --compiled-sources")
+    if args.vex and not (args.compiled_sources or args.kernel_repository):
+        parser.error("--vex needs --compiled-sources or --kernel-repository")
     try:
         run(args)
     except (OSError, KeyError, ValueError) as error:
