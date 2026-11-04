@@ -166,6 +166,7 @@ def test_run(tmp_path):
         [sys.executable, SCRIPT, "--vulns", str(tmp_path / "vulns"),
          "--sbom", str(sbom), "--compiled-sources", str(sources),
          "--osv-dir", str(tmp_path / "osv"),
+         "--upstream-fixes", str(tmp_path / "fixes.json"),
          "--vex", str(tmp_path / "kernel.openvex.json")],
         check=True, capture_output=True, text=True)
     assert "3 kernel CVEs, 2 affect the version" in result.stdout
@@ -177,6 +178,13 @@ def test_run(tmp_path):
         "CVE-2026-10.osv.json", "CVE-2026-11.osv.json"]
     osv = json.loads((osv_dir / "CVE-2026-10.osv.json").read_text())
     assert osv["summary"] == "foo: fix bar"
+    assert osv["details"].endswith("\n\nFixed upstream in 7.3.")
+    assert json.loads((tmp_path / "fixes.json").read_text()) == {
+        "kernels": [{
+            "source": "linux-qcom-7.2", "version": QLI_VERSION,
+            "packages": ["linux-headers-qcom-7.2", "linux-image-qcom-7.2"],
+            "cves": {"CVE-2026-10": ["7.3"], "CVE-2026-11": ["7.3"]},
+        }]}
     assert osv["database_specific"] == {"severity": "high"}
     assert osv["affected"] == [{
         "package": {"ecosystem": "Debian:13", "name": "linux-qcom-7.2"},
@@ -432,3 +440,29 @@ def test_base_tag(version, tag):
     kernel = kernel_cves.KernelVersion(map(int, numbers.split(".")),
                                        int(rc) if rc else None)
     assert kernel_cves.base_tag(kernel) == tag
+
+
+@pytest.mark.parametrize("version, fixes", [
+    # the stable release of the kernel's branch, then the mainline one
+    ("7.2.0", ["7.2.5", "7.3"]),
+    ("6.6.10", ["6.6.79", "7.3"]),
+    # no stable fix for the branch
+    ("7.1.0", ["7.3"]),
+    ("7.3.0-rc4", ["7.3"]),
+])
+def test_upstream_fixes(version, fixes):
+    cve = record("CVE-2026-40", semver("5.19", "6.6.79", "7.2.5",
+                                       mainline="7.3"), ["io_uring/kbuf.c"])
+    numbers, _, rc = version.partition("-rc")
+    kernel = kernel_cves.KernelVersion(map(int, numbers.split(".")),
+                                       int(rc) if rc else None)
+    assert kernel_cves.upstream_fixes(cve, kernel) == fixes
+
+
+def test_upstream_fixes_none():
+    # a bug only stable releases had
+    versions = [{"version": "6.6.50", "lessThan": "6.6.55",
+                 "status": "affected", "versionType": "semver"}]
+    cve = record("CVE-2026-41", versions, ["mm/foo.c"], default="unaffected")
+    assert kernel_cves.upstream_fixes(
+        cve, kernel_cves.deb_kernel_version("6.6.52-1")) == []

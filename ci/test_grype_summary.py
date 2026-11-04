@@ -291,3 +291,36 @@ def test_summary_counts_only_high_open(tmp_path):
     assert "1 critical severity vulnerabilities" in result.stdout
     assert "| CVE-2026-2 |" in result.stdout
     assert "| CVE-2026-12345 |" not in result.stdout
+
+
+def test_summary_fixed_upstream(tmp_path):
+    # the kernel CVEs Grype reports as not fixed, fixed upstream
+    version = "7.2.0+git20261008~gb8f0c6b1ab06-0qli1~bpo13+1"
+    kernel = grype_match("linux-image-qcom-7.2", version=version,
+                         vuln_id="CVE-2026-1")
+    other = grype_match("openssl", vuln_id="CVE-2026-2")
+    wontfix = grype_match("linux-image-qcom-7.2", version=version,
+                          vuln_id="CVE-2026-3", fix_state="wont-fix")
+    fixes = {"kernels": [{
+        "source": "linux-qcom-7.2", "version": version,
+        "packages": ["linux-image-qcom-7.2", "linux-headers-qcom-7.2"],
+        "cves": {"CVE-2026-1": ["7.2.13", "7.3"], "CVE-2026-2": ["9.9"],
+                 "CVE-2026-3": ["7.3"]},
+    }]}
+    data = {"matches": [kernel, other, wontfix], "ignoredMatches": []}
+    result = script("grype-vulnerability-summary.py",
+                    write(tmp_path, "grype.json", data),
+                    "--upstream-fixes", write(tmp_path, "fixes.json", fixes))
+    assert result.returncode == 0, result.stderr
+    rows = {line.split(" | ")[0][2:]: line
+            for line in result.stdout.splitlines()
+            if line.startswith("| CVE-")}
+    # in the order given, not sorted
+    assert '<span title="fixed upstream, in no package of this kernel ' \
+        'yet">\U0001F7E0</span> fixed upstream `7.2.13`, `7.3`' in \
+        rows["CVE-2026-1"]
+    assert "not-fixed" not in rows["CVE-2026-1"]
+    # only for the kernel's packages, and only instead of not fixed
+    assert "\U0001F534</span> not-fixed" in rows["CVE-2026-2"]
+    assert "wont-fix" in rows["CVE-2026-3"]
+    assert "fixed upstream" not in rows["CVE-2026-3"]

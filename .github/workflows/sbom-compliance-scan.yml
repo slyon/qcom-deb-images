@@ -229,6 +229,7 @@ jobs:
                       --compiled-sources compiled-sources \
                       --kernel-repository https://github.com/qualcomm-linux/kernel \
                       --osv-dir kernel-osv \
+                      --upstream-fixes "${dir}/rootfs-kernel-fixes.json" \
                       --vex "${dir}/rootfs-kernel.openvex.json"
               } | tee "${dir}/rootfs-kernel-cves.txt"
           done
@@ -360,7 +361,8 @@ jobs:
                   rootfs-vulns.grype.json
                   rootfs-vulns.grype.txt
               )
-              for f in rootfs-kernel-cves.txt rootfs-kernel.openvex.json; do
+              for f in rootfs-kernel-cves.txt rootfs-kernel-fixes.json \
+                       rootfs-kernel.openvex.json; do
                   if [ -f "sboms/${prefix}/${f}" ]; then
                       files+=("${f}")
                   fi
@@ -406,10 +408,16 @@ jobs:
                   echo "# ${prefix}"
                   echo
               } >>"$GITHUB_STEP_SUMMARY"
+              # the kernel CVEs fixed upstream, if any
+              upstream=()
+              if [ -f "${dir}/rootfs-kernel-fixes.json" ]; then
+                  upstream=(--upstream-fixes "${dir}/rootfs-kernel-fixes.json")
+              fi
               scripts/grype-vulnerability-summary.py \
                   "${dir}/rootfs-vulns.grype.json" \
                   --sbom "${dir}/rootfs-sbom.syft.json" \
                   --triage "${dir}/rootfs-vulns-triage.grype.json" \
+                  "${upstream[@]}" \
                   >>"$GITHUB_STEP_SUMMARY"
               if [ -s "${dir}/rootfs-kernel-cves.txt" ]; then
                   {

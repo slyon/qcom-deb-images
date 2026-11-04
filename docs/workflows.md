@@ -131,6 +131,12 @@ cached), and `scripts/kernel-cves.py` assesses the kernel of each image:
   year before the build date. A fix older than that is missed, so its CVE
   stays open
 
+The CVEs left open are reported as not fixed: no version of the kernel's
+package is known to fix them. The upstream releases fixing them, the stable
+release of the kernel's branch and the mainline one, are in their
+description, in `rootfs-kernel-fixes.json`, and in the job summary, which
+shows them as 🟠 fixed upstream.
+
 The counts are in `rootfs-kernel-cves.txt` and in the job summary. Backports
 naming no upstream commit, e.g. of patches from a mailing list
 (`FROMLIST:`), aren't recognized.
@@ -160,9 +166,10 @@ Each image directory holds the files of its `<prefix>-sbom.tar.gz` and
   `rootfs-vulns.grype.txt.gz`: the Grype vulnerability reports, including the
   findings from the QLI advisories
 * `rootfs-vex-warnings.txt.gz`: the VEX coverage warnings
-* `rootfs-kernel-cves.txt.gz`, `rootfs-kernel.openvex.json.gz`: the kernel CVE
-  assessment and its VEX statements, for images with a QLI kernel; see
-  [Kernel CVEs](#kernel-cves)
+* `rootfs-kernel-cves.txt.gz`, `rootfs-kernel-fixes.json.gz`,
+  `rootfs-kernel.openvex.json.gz`: the kernel CVE assessment, the upstream
+  releases fixing the CVEs and the VEX statements, for images with a QLI
+  kernel; see [Kernel CVEs](#kernel-cves)
 
 along with an uncompressed `manifest.json` giving the build the data describes
 (`build.id`, `build.run_url`, `build.artifacts_url` where its images are), the
