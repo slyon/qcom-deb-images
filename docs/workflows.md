@@ -123,16 +123,28 @@ or `/usr/lib/modules/*/vmlinuz`, unless it comes from a Debian archive, per
   directories with compiled sources. Without that package, e.g. for kernels
   built with `bindeb-pkg`, from no known archive, or ones removed from the
   archive by now, the kernel is assessed by version alone, with a warning
+* those one of whose fix commits, mainline or stable, is in the history of
+  the commit the kernel is built from, which its package version names (e.g.
+  `ae2606baf50f`), get a `fixed` statement in that document: release
+  candidates and git snapshots carry fixes their version doesn't tell, e.g.
+  a 7.3-rc4 snapshot those merged for 7.3 by then. Backports count when
+  they name the commit they backport, the way `git cherry-pick -x` and the
+  stable releases do. The scan fetches the commits of the 9 months before the
+  upstream tag the kernel is based on (e.g. `v7.3` or `v7.3-rc4`) from
+  [qualcomm-linux/kernel](https://github.com/qualcomm-linux/kernel), without
+  their files, about 40 MB: the commits merged in a release cycle are
+  committed at most about 6 months before it. Without that tag, it's the
+  year before the build date. A fix older than that is missed, so its CVE
+  stays open
 * those left open which an upstream release fixes, the stable release of the
   kernel's branch or the mainline one, get an `affected` statement in that
   document naming the releases, which the job summary shows as 🟠 triaged
   rather than not fixed. The releases are also added to the end of each CVE's
   description, so Grype's reports show them too
 
-The counts are in `rootfs-kernel-cves.txt` and in the job summary. The
-version check is conservative: release candidates and git snapshots count as
-before their release, and fixes backported outside of stable releases aren't
-known.
+The counts are in `rootfs-kernel-cves.txt` and in the job summary. Backports
+naming no upstream commit, e.g. of patches from a mailing list
+(`FROMLIST:`), aren't recognized.
 
 ### Latest compliance data
 

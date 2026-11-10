@@ -202,13 +202,19 @@ jobs:
           echo "commit=$(git -C kernel-vulns rev-parse HEAD)" >>"$GITHUB_OUTPUT"
 
       # the CVEs affecting the version of each image's kernel, as OSV records
-      # for the next step, and an OpenVEX document marking those whose fix
-      # changes no file compiled into it, from the debug info of its -dbg
+      # for the next step, and an OpenVEX document marking those fixed by a
+      # commit in the history of its build commit as fixed, and those whose
+      # fix changes no file compiled into it, from the debug info of its -dbg
       # package in the APT archive the image installed it from, as not
       # affected. Kernels from a Debian archive, per the APT origins the image
       # build records, are left out, the Debian security tracker covers them
+      #
+      # the token only resolves the abbreviated commit IDs of the kernel
+      # package versions, with GitHub's API
       - name: Assess kernel CVEs
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euxo pipefail
           for prefix in ${PREFIXES}; do
@@ -225,6 +231,7 @@ jobs:
                       --sbom "${dir}/rootfs-sbom.syft.json" \
                       --apt-origins "${dir}/rootfs-sbom.syft-apt-origins.json" \
                       --compiled-sources compiled-sources \
+                      --kernel-repository https://github.com/qualcomm-linux/kernel \
                       --osv-dir kernel-osv \
                       --vex "${dir}/rootfs-kernel.openvex.json"
               } | tee "${dir}/rootfs-kernel-cves.txt"
